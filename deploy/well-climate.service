@@ -1,0 +1,21 @@
+[Unit]
+Description=Well-Climate production site
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/well-climate/current
+Environment=NODE_ENV=production
+Environment=PORT=3001
+EnvironmentFile=-/etc/well-climate/well-climate.env
+Environment=PATH=/opt/well-climate/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/opt/well-climate/node/bin/node /var/www/well-climate/current/node_modules/vinext/dist/cli.js start --port 3001 --hostname 127.0.0.1
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
