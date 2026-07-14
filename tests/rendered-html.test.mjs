@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { POST as handleLead } from "../app/api/lead/route.ts";
+import { POST as handleTelegramRelay } from "../app/api/internal/telegram/route.ts";
 import { formatRussianPhone, validateProjectFile, validateRussianPhone } from "../app/formValidation.ts";
 
 async function loadWorker(label) {
@@ -33,6 +34,58 @@ function makeLeadForm({ phone = "+7 (903) 018-30-25", file, service = "VRF / VRV
   if (file) form.set("project", file, file.name);
   return form;
 }
+
+function relayRequest(payload, secret, deliveryKey = "telegram-test-delivery") {
+  const body = JSON.stringify(payload);
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const signature = createHmac("sha256", secret).update(`${timestamp}.${body}`).digest("hex");
+  return new Request("http://localhost/api/internal/telegram", {
+    method: "POST",
+    body,
+    headers: {
+      "Content-Type": "application/json",
+      "Idempotency-Key": deliveryKey,
+      "X-Well-Climate-Timestamp": timestamp,
+      "X-Well-Climate-Signature": `sha256=${signature}`,
+    },
+  });
+}
+
+test("signed Telegram relay validates requests and suppresses a replay", async () => {
+  const secret = "relay-test-secret-with-at-least-32-characters";
+  const oldSecret = process.env.CRM_INTAKE_SECRET;
+  const oldToken = process.env.TELEGRAM_BOT_TOKEN;
+  const oldFetch = globalThis.fetch;
+  process.env.CRM_INTAKE_SECRET = secret;
+  process.env.TELEGRAM_BOT_TOKEN = "123456789:test-token-with-at-least-thirty-characters";
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), payload: JSON.parse(String(init.body)) });
+    return Response.json({ ok: true, result: { message_id: 701 } });
+  };
+  try {
+    const payload = {
+      chat_id: "-1001234567890",
+      text: "Тест служебного уведомления",
+      action_url: "https://app.well-climate.ru/crm?deal=1",
+    };
+    const first = await handleTelegramRelay(relayRequest(payload, secret));
+    const replay = await handleTelegramRelay(relayRequest(payload, secret));
+    assert.equal(first.status, 200);
+    assert.equal(replay.status, 200);
+    assert.equal((await replay.json()).replay, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].payload.chat_id, payload.chat_id);
+    assert.equal(calls[0].payload.reply_markup.inline_keyboard[0][0].text, "Открыть карточку");
+
+    const rejected = await handleTelegramRelay(relayRequest(payload, "wrong-secret-with-at-least-32-characters", "telegram-bad-signature"));
+    assert.equal(rejected.status, 401);
+  } finally {
+    globalThis.fetch = oldFetch;
+    if (oldSecret === undefined) delete process.env.CRM_INTAKE_SECRET; else process.env.CRM_INTAKE_SECRET = oldSecret;
+    if (oldToken === undefined) delete process.env.TELEGRAM_BOT_TOKEN; else process.env.TELEGRAM_BOT_TOKEN = oldToken;
+  }
+});
 
 async function withMockTelegram(mock, action, crmMock = async () => Response.json({
   created: true,
