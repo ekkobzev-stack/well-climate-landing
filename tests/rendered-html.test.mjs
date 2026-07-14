@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
@@ -33,18 +34,32 @@ function makeLeadForm({ phone = "+7 (903) 018-30-25", file, service = "VRF / VRV
   return form;
 }
 
-async function withMockTelegram(mock, action) {
+async function withMockTelegram(mock, action, crmMock = async () => Response.json({
+  created: true,
+  event_id: 1,
+  lead_id: 1,
+  deal_id: 1,
+  task_id: 1,
+}, { status: 201 })) {
   const oldToken = process.env.TELEGRAM_BOT_TOKEN;
   const oldChat = process.env.TELEGRAM_CHAT_ID;
+  const oldCrmUrl = process.env.CRM_INTAKE_URL;
+  const oldCrmSecret = process.env.CRM_INTAKE_SECRET;
   const oldFetch = globalThis.fetch;
   process.env.TELEGRAM_BOT_TOKEN = "test-token-not-a-secret";
   process.env.TELEGRAM_CHAT_ID = "123456";
-  globalThis.fetch = mock;
+  process.env.CRM_INTAKE_URL = "https://crm.example.test/api/intake/website";
+  process.env.CRM_INTAKE_SECRET = "crm-test-secret-with-at-least-32-characters";
+  globalThis.fetch = (url, init) => String(url) === process.env.CRM_INTAKE_URL
+    ? crmMock(url, init)
+    : mock(url, init);
   try { return await action(); }
   finally {
     globalThis.fetch = oldFetch;
     if (oldToken === undefined) delete process.env.TELEGRAM_BOT_TOKEN; else process.env.TELEGRAM_BOT_TOKEN = oldToken;
     if (oldChat === undefined) delete process.env.TELEGRAM_CHAT_ID; else process.env.TELEGRAM_CHAT_ID = oldChat;
+    if (oldCrmUrl === undefined) delete process.env.CRM_INTAKE_URL; else process.env.CRM_INTAKE_URL = oldCrmUrl;
+    if (oldCrmSecret === undefined) delete process.env.CRM_INTAKE_SECRET; else process.env.CRM_INTAKE_SECRET = oldCrmSecret;
   }
 }
 
@@ -72,7 +87,8 @@ test("renders finished privacy page without internal notes", async () => {
   assert.equal(response.status, 200);
   const html = await response.text();
   assert.match(html, /Политика обработки персональных данных/);
-  assert.match(html, /серверную интеграцию с Telegram/);
+  assert.match(html, /защищённому каналу во внутреннюю CRM Well-Climate/);
+  assert.match(html, /служебное уведомление в Telegram/);
   assert.doesNotMatch(html, /Юридические реквизиты оператора должны|защищённый канал Telegram/);
 });
 
@@ -102,11 +118,15 @@ test("validates project file type and 20 MB limit on the client", () => {
   assert.match(validateProjectFile(new File([new Uint8Array(20 * 1024 * 1024 + 1)], "large.pdf")), /20 МБ/);
 });
 
-test("lead endpoint fails safely when Telegram is not configured", async () => {
+test("lead endpoint fails safely when delivery is not configured", async () => {
   const oldToken = process.env.TELEGRAM_BOT_TOKEN;
   const oldChat = process.env.TELEGRAM_CHAT_ID;
+  const oldCrmUrl = process.env.CRM_INTAKE_URL;
+  const oldCrmSecret = process.env.CRM_INTAKE_SECRET;
   delete process.env.TELEGRAM_BOT_TOKEN;
   delete process.env.TELEGRAM_CHAT_ID;
+  delete process.env.CRM_INTAKE_URL;
+  delete process.env.CRM_INTAKE_SECRET;
   try {
     const response = await handleLead(new Request("http://localhost/api/lead", { method: "POST", body: makeLeadForm() }));
     assert.equal(response.status, 503);
@@ -114,7 +134,42 @@ test("lead endpoint fails safely when Telegram is not configured", async () => {
   } finally {
     if (oldToken !== undefined) process.env.TELEGRAM_BOT_TOKEN = oldToken;
     if (oldChat !== undefined) process.env.TELEGRAM_CHAT_ID = oldChat;
+    if (oldCrmUrl !== undefined) process.env.CRM_INTAKE_URL = oldCrmUrl;
+    if (oldCrmSecret !== undefined) process.env.CRM_INTAKE_SECRET = oldCrmSecret;
   }
+});
+
+test("lead endpoint signs and sends the exact website payload to CRM", async () => {
+  let crmCall;
+  await withMockTelegram(
+    async () => Response.json({ ok: true, result: {} }),
+    async () => {
+      const response = await handleLead(new Request("http://localhost/api/lead", {
+        method: "POST",
+        body: makeLeadForm({ phone: "+7 (903) 555-66-77", service: "Вентиляция" }),
+        headers: { "x-forwarded-for": "127.0.0.71" },
+      }));
+      assert.equal(response.status, 200);
+    },
+    async (url, init) => {
+      crmCall = { url: String(url), init };
+      return Response.json({ created: true, event_id: 17, lead_id: 18, deal_id: 19, task_id: 20 }, { status: 201 });
+    },
+  );
+
+  assert.equal(crmCall.url, "https://crm.example.test/api/intake/website");
+  const payload = JSON.parse(crmCall.init.body);
+  const headers = crmCall.init.headers;
+  assert.match(payload.external_id, /^website-\d+-[0-9a-f-]{36}$/);
+  assert.equal(payload.phone, "+7 (903) 555-66-77");
+  assert.equal(payload.object_type, "Бизнес-центр или офис");
+  assert.equal(payload.service, "Вентиляция");
+  assert.equal(headers["Idempotency-Key"], payload.external_id);
+  const timestamp = headers["X-Well-Climate-Timestamp"];
+  const expected = createHmac("sha256", "crm-test-secret-with-at-least-32-characters")
+    .update(`${timestamp}.${crmCall.init.body}`)
+    .digest("hex");
+  assert.equal(headers["X-Well-Climate-Signature"], `sha256=${expected}`);
 });
 
 test("mock Telegram receives service, UTM, page, PDF and image", async () => {
@@ -169,12 +224,30 @@ test("server rejects oversized files before calling Telegram", async () => {
   assert.equal(telegramCalls, 0);
 });
 
-test("Telegram error is reported and does not silently lose the lead", async () => {
+test("Telegram error does not lose a lead already registered in CRM", async () => {
   await withMockTelegram(async () => Response.json({ ok: false }, { status: 502 }), async () => {
     const response = await handleLead(new Request("http://localhost/api/lead", { method: "POST", body: makeLeadForm({ phone: "+7 (903) 222-33-44" }) }));
-    assert.equal(response.status, 502);
-    assert.match((await response.json()).error, /Не удалось передать заявку/);
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).notification, "delayed");
   });
+});
+
+test("CRM error blocks Telegram and reports that the lead was not registered", async () => {
+  let telegramCalls = 0;
+  await withMockTelegram(
+    async () => { telegramCalls += 1; return Response.json({ ok: true }); },
+    async () => {
+      const response = await handleLead(new Request("http://localhost/api/lead", {
+        method: "POST",
+        body: makeLeadForm({ phone: "+7 (903) 777-88-99" }),
+        headers: { "x-forwarded-for": "127.0.0.72" },
+      }));
+      assert.equal(response.status, 502);
+      assert.match((await response.json()).error, /Не удалось зарегистрировать заявку/);
+    },
+    async () => Response.json({ error: "unavailable" }, { status: 503 }),
+  );
+  assert.equal(telegramCalls, 0);
 });
 
 test("spam protection blocks an immediate duplicate", async () => {
@@ -210,5 +283,5 @@ async function readClientFiles(directory) {
 
 test("client artifact contains no server secrets", async () => {
   const contents = (await readClientFiles(fileURLToPath(new URL("../dist/client", import.meta.url)))).join("\n");
-  assert.doesNotMatch(contents, /TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|test-token-not-a-secret/);
+  assert.doesNotMatch(contents, /TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|CRM_INTAKE_SECRET|test-token-not-a-secret|crm-test-secret-with-at-least-32-characters/);
 });
