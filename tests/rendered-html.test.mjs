@@ -6,6 +6,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { POST as handleLead } from "../app/api/lead/route.ts";
 import { POST as handleTelegramRelay } from "../app/api/internal/telegram/route.ts";
+import { POST as handleTelegramWebhook } from "../app/api/internal/telegram/webhook/route.ts";
 import { formatRussianPhone, validateProjectFile, validateRussianPhone } from "../app/formValidation.ts";
 
 async function loadWorker(label) {
@@ -68,6 +69,7 @@ test("signed Telegram relay validates requests and suppresses a replay", async (
       chat_id: "-1001234567890",
       text: "Тест служебного уведомления",
       action_url: "https://app.well-climate.ru/crm?deal=1",
+      actions: [{ text: "Принять заявку", callback_data: "wc1:accept:1:1:1:0123456789abcdef" }],
     };
     const first = await handleTelegramRelay(relayRequest(payload, secret));
     const replay = await handleTelegramRelay(relayRequest(payload, secret));
@@ -76,7 +78,9 @@ test("signed Telegram relay validates requests and suppresses a replay", async (
     assert.equal((await replay.json()).replay, true);
     assert.equal(calls.length, 1);
     assert.equal(calls[0].payload.chat_id, payload.chat_id);
-    assert.equal(calls[0].payload.reply_markup.inline_keyboard[0][0].text, "Открыть карточку");
+    assert.equal(calls[0].payload.reply_markup.inline_keyboard[0][0].text, "Принять заявку");
+    assert.equal(calls[0].payload.reply_markup.inline_keyboard[0][0].callback_data, payload.actions[0].callback_data);
+    assert.equal(calls[0].payload.reply_markup.inline_keyboard[1][0].text, "Открыть карточку");
 
     const rejected = await handleTelegramRelay(relayRequest(payload, "wrong-secret-with-at-least-32-characters", "telegram-bad-signature"));
     assert.equal(rejected.status, 401);
@@ -84,6 +88,71 @@ test("signed Telegram relay validates requests and suppresses a replay", async (
     globalThis.fetch = oldFetch;
     if (oldSecret === undefined) delete process.env.CRM_INTAKE_SECRET; else process.env.CRM_INTAKE_SECRET = oldSecret;
     if (oldToken === undefined) delete process.env.TELEGRAM_BOT_TOKEN; else process.env.TELEGRAM_BOT_TOKEN = oldToken;
+  }
+});
+
+test("Telegram webhook authenticates callbacks and signs CRM quick actions", async () => {
+  const webhookSecret = "telegram-webhook-secret-with-at-least-32-chars";
+  const crmSecret = "crm-action-secret-with-at-least-32-characters";
+  const oldWebhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+  const oldCrmSecret = process.env.CRM_INTAKE_SECRET;
+  const oldToken = process.env.TELEGRAM_BOT_TOKEN;
+  const oldActionUrl = process.env.CRM_TELEGRAM_ACTION_URL;
+  const oldFetch = globalThis.fetch;
+  process.env.TELEGRAM_WEBHOOK_SECRET = webhookSecret;
+  process.env.CRM_INTAKE_SECRET = crmSecret;
+  process.env.TELEGRAM_BOT_TOKEN = "123456789:test-token-with-at-least-thirty-characters";
+  process.env.CRM_TELEGRAM_ACTION_URL = "https://app.well-climate.ru/api/intake/telegram/action";
+  const callbackData = "wc1:accept:7:5:3:0123456789abcdef";
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    if (String(url) === process.env.CRM_TELEGRAM_ACTION_URL) {
+      return Response.json({ ok: true, action: "accept", message: "Заявка принята", replay: false });
+    }
+    return Response.json({ ok: true, result: true });
+  };
+  const update = {
+    update_id: 10,
+    callback_query: {
+      id: "callback-query-123",
+      from: { id: 777 },
+      data: callbackData,
+      message: { chat: { id: 123456789 } },
+    },
+  };
+  const request = (secret) => new Request("http://localhost/api/internal/telegram/webhook", {
+    method: "POST",
+    body: JSON.stringify(update),
+    headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": secret },
+  });
+  try {
+    const rejected = await handleTelegramWebhook(request("wrong-webhook-secret-with-at-least-32-chars"));
+    assert.equal(rejected.status, 401);
+    const response = await handleTelegramWebhook(request(webhookSecret));
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { ok: true });
+    assert.equal(calls.length, 2);
+    const crmCall = calls[0];
+    const crmBody = Buffer.from(crmCall.init.body);
+    const timestamp = crmCall.init.headers["X-Well-Climate-Timestamp"];
+    const expected = createHmac("sha256", crmSecret).update(`${timestamp}.`).update(crmBody).digest("hex");
+    assert.equal(crmCall.init.headers["X-Well-Climate-Signature"], `sha256=${expected}`);
+    assert.equal(crmCall.init.headers["Idempotency-Key"], update.callback_query.id);
+    assert.deepEqual(JSON.parse(crmBody.toString()), {
+      callback_query_id: update.callback_query.id,
+      callback_data: callbackData,
+      chat_id: "123456789",
+      telegram_user_id: "777",
+    });
+    assert.match(calls[1].url, /answerCallbackQuery$/);
+    assert.equal(JSON.parse(calls[1].init.body).text, "Заявка принята");
+  } finally {
+    globalThis.fetch = oldFetch;
+    if (oldWebhookSecret === undefined) delete process.env.TELEGRAM_WEBHOOK_SECRET; else process.env.TELEGRAM_WEBHOOK_SECRET = oldWebhookSecret;
+    if (oldCrmSecret === undefined) delete process.env.CRM_INTAKE_SECRET; else process.env.CRM_INTAKE_SECRET = oldCrmSecret;
+    if (oldToken === undefined) delete process.env.TELEGRAM_BOT_TOKEN; else process.env.TELEGRAM_BOT_TOKEN = oldToken;
+    if (oldActionUrl === undefined) delete process.env.CRM_TELEGRAM_ACTION_URL; else process.env.CRM_TELEGRAM_ACTION_URL = oldActionUrl;
   }
 });
 

@@ -5,6 +5,7 @@ export const runtime = "nodejs";
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_CLOCK_SKEW_SECONDS = 300;
 const delivered = new Map<string, { messageId: string; receivedAt: number }>();
+type TelegramAction = { text: string; callback_data: string };
 
 function jsonError(error: string, status: number) {
   return Response.json({ ok: false, error }, { status });
@@ -34,7 +35,18 @@ function validPayload(value: unknown) {
   const chatId = typeof payload.chat_id === "string" ? payload.chat_id.trim() : "";
   const text = typeof payload.text === "string" ? payload.text.trim() : "";
   const actionUrl = typeof payload.action_url === "string" ? payload.action_url.trim() : "";
+  const rawActions = payload.actions === undefined ? [] : payload.actions;
   if (!/^-?[1-9]\d+$/.test(chatId) || !text || text.length > 4000) return null;
+  if (!Array.isArray(rawActions) || rawActions.length > 3) return null;
+  const actions: TelegramAction[] = [];
+  for (const value of rawActions) {
+    if (!value || typeof value !== "object") return null;
+    const action = value as Record<string, unknown>;
+    const label = typeof action.text === "string" ? action.text.trim() : "";
+    const callbackData = typeof action.callback_data === "string" ? action.callback_data.trim() : "";
+    if (!label || label.length > 40 || !/^[A-Za-z0-9:_-]{10,64}$/.test(callbackData)) return null;
+    actions.push({ text: label, callback_data: callbackData });
+  }
   if (actionUrl) {
     try {
       const url = new URL(actionUrl);
@@ -43,7 +55,7 @@ function validPayload(value: unknown) {
       return null;
     }
   }
-  return { chatId, text, actionUrl };
+  return { chatId, text, actionUrl, actions };
 }
 
 export async function POST(request: Request) {
@@ -78,9 +90,16 @@ export async function POST(request: Request) {
     text: payload.text,
     disable_web_page_preview: true,
   };
-  if (payload.actionUrl) {
+  if (payload.actions.length || payload.actionUrl) {
+    const inlineKeyboard: Array<Array<Record<string, string>>> = payload.actions.map((action) => [{
+      text: action.text,
+      callback_data: action.callback_data,
+    }]);
+    if (payload.actionUrl) {
+      inlineKeyboard.push([{ text: "Открыть карточку", url: payload.actionUrl }]);
+    }
     telegramPayload.reply_markup = {
-      inline_keyboard: [[{ text: "Открыть карточку", url: payload.actionUrl }]],
+      inline_keyboard: inlineKeyboard,
     };
   }
 
